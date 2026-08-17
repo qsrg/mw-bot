@@ -1,0 +1,40 @@
+# Go 构建产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+rocketmq-mcp-server
+
+# IDE 与编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# 文档与设计稿
+.trae/
+docs/
+README.md
+AGENTS.md
+
+# 前端构建产物与依赖（前端独立镜像构建）
+frontend/node_modules/
+frontend/dist/
+
+# 本地数据卷（容器内生成，避免镜像膨胀）
+data/
+
+# 运行时日志
+*.log
+
+# 环境变量文件（含密钥，禁止进入构建上下文，M30）
+.env
+.env.*

@@ -1,0 +1,44 @@
+# Go
+/bin/
+*.exe
+*.test
+*.out
+vendor/
+go.work.sum
+
+# 环境配置
+.env
+*.env.local
+
+# 本地二进制构建产物（data/ 目录由用户要求纳入版本控制）
+backend-api
+rocketmq-mcp-server
+
+# chromem-go 向量库运行时持久化文件（每次启动可能增量变化，不纳入版本控制）
+data/chroma/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# AI 工具本地配置
+.claude/settings.local.json
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+frontend/.vite/
+# TypeScript/Vue SFC 编译产物（保留 .ts/.vue 源文件）
+frontend/src/**/*.js
+frontend/src/**/*.js.map
+
+# Python 参考目录（仅用于对照，不参与构建）
+backend/
+
+# 日志
+*.log
+logs/

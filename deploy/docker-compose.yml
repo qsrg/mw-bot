@@ -1,0 +1,98 @@
+# 企业内部智能问答系统本地部署编排（Go 版）
+# MySQL/Redis/MinIO/模型网关假定在宿主机运行，容器通过 host.docker.internal 访问
+# 使用：docker compose -f deploy/docker-compose.yml up -d --build
+#
+# 与 Python 版差异：
+#   - 无 chroma sidecar：chromem-go 内嵌于 backend-api 进程，向量数据落 data/chroma 卷
+#   - backend-api 单二进制：无 Python 运行时与依赖安装开销
+#   - data 卷合并：uploads + chroma 统一挂载到 /app/data
+
+services:
+  # ---- 后端 API 服务 ----
+  backend-api:
+    build:
+      context: ..                    # 项目根目录（Dockerfile.backend 所在位置）
+      dockerfile: Dockerfile.backend
+    environment:
+      # 数据库连接串 — 必填，含密码，从宿主机环境变量注入
+      DATABASE_URL: ${DATABASE_URL}
+      # Redis 连接串（MVP 未直接使用，保留配置位）
+      REDIS_URL: ${REDIS_URL}
+      # 文件存储后端：local=本地文件系统，生产可切换为 minio
+      STORAGE_BACKEND: local
+      # 本地文件存储根目录（容器内路径，与 data 卷挂载点一致）
+      LOCAL_STORAGE_ROOT: data/uploads
+      # chromem-go 向量库持久化目录（容器内路径，与 data 卷挂载点一致）
+      CHROMA_PERSIST_PATH: data/chroma
+      # 运行环境标识（local 时 Embedding 走 Fake Provider，便于无网关本地联调）
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      # 混合检索开关（dense + BM25 RRF 融合）
+      HYBRID_SEARCH: ${HYBRID_SEARCH:-true}
+      # 意图检测开关（LLM 精判，关闭则规则快速通道兜底）
+      INTENT_DETECTION: ${INTENT_DETECTION:-false}
+      # 大模型网关（OpenAI 兼容）— 必填
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:9000/v1}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL:-qwen-plus}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-v4}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1024}
+      # Embedding 网关（与 LLM 网关分离时单独配置，为空回退 LLM 网关）
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      # 检索参数（M27：补齐可经 .env 覆盖的检索/记忆/JWT 配置）
+      RETRIEVE_LIMIT: ${RETRIEVE_LIMIT:-5}
+      RETRIEVE_SCORE_THRESHOLD: ${RETRIEVE_SCORE_THRESHOLD:-0.3}
+      RERANK_TOP_N: ${RERANK_TOP_N:-5}
+      MIDDLEWARES: ${MIDDLEWARES:-rocketmq,kafka,rabbitmq,pulsar,redis,nacos}
+      # 会话记忆 token 预算与压缩比例
+      HISTORY_TOKEN_BUDGET: ${HISTORY_TOKEN_BUDGET:-100000}
+      HISTORY_RECENT_RATIO: ${HISTORY_RECENT_RATIO:-0.7}
+      # MinIO 对象存储 — 必填（STORAGE_BACKEND=minio 时使用）
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-host.docker.internal:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET:-ai-qa-documents}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      # JWT 认证 — 必填，生产环境务必使用强随机密钥
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      ACCESS_TOKEN_MINUTES: ${ACCESS_TOKEN_MINUTES:-120}
+      # 后端 HTTP 监听端口
+      APP_PORT: 8080
+    extra_hosts:
+      # 将 host.docker.internal 映射到宿主机网关地址
+      # 作用：容器内可通过 host.docker.internal 访问宿主机上的 MySQL/Redis/MinIO/模型网关
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:8080"                  # 宿主机端口:容器端口
+    volumes:
+      - backend-data:/app/data       # 单卷合并 uploads + chroma，持久化向量库与上传文件
+
+  # ---- RocketMQ MCP Server ----
+  # 独立部署的 MCP Server，提供 RocketMQ 集群查询工具
+  rocketmq-mcp-server:
+    build:
+      context: ..                    # 项目根目录
+      dockerfile: Dockerfile.mcp-server
+    environment:
+      # RocketMQ NameServer 地址（real 模式必填，默认 localhost:9876 走 mock）
+      ROCKETMQ_NAMESRV: ${ROCKETMQ_NAMESRV:-localhost:9876}
+      # MCP Server HTTP 监听端口
+      APP_PORT: 10914
+    ports:
+      - "10914:10914"                # MCP Server 监听端口
+
+  # ---- 前端服务 ----
+  frontend:
+    build:
+      context: ../frontend           # 前端 Dockerfile 目录
+    ports:
+      - "5173:80"                    # 宿主机 5173 映射到容器内 Nginx 80 端口
+    depends_on:
+      - backend-api                  # 确保后端 API 先启动（nginx 反代依赖 backend-api 服务名）
+
+# ---- 持久化卷 ----
+# Docker 命名卷，数据在 docker compose down 后仍保留
+# 执行 docker compose down -v 才会删除卷数据
+volumes:
+  backend-data:                      # backend-api 数据卷（uploads + chroma）
