@@ -10,12 +10,12 @@ go.work.sum
 .env
 *.env.local
 
-# 本地二进制构建产物（data/ 目录由用户要求纳入版本控制）
+# 本地二进制构建产物
 backend-api
 rocketmq-mcp-server
 
-# chromem-go 向量库运行时持久化文件（每次启动可能增量变化，不纳入版本控制）
-data/chroma/
+# 运行时数据（向量库持久化/上传文档等，每次启动可能增量变化）
+data/
 
 # IDE
 .idea/
