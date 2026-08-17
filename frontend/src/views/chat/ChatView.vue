@@ -329,7 +329,7 @@ onMounted(loadConversations);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 13px;
+  font-size: 14px;
 }
 .history-item-delete {
   flex-shrink: 0;
