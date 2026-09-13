@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strings"
 
+	"fmt"
 	"mw-bot/internal/audit"
 	"mw-bot/internal/auth"
 	"mw-bot/internal/common"
@@ -47,6 +48,173 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("/api/mcp/servers/", h.authH.AuthMiddleware(http.HandlerFunc(h.serverByID)))
 	mux.Handle("/api/mcp/tools", h.authH.AuthMiddleware(http.HandlerFunc(h.toolsRoot)))
 	mux.Handle("/api/mcp/tools/", h.authH.AuthMiddleware(http.HandlerFunc(h.toolByID)))
+	mux.Handle("/api/mcp/middleware-options", h.authH.AuthMiddleware(http.HandlerFunc(h.middlewareOptions)))
+	mux.Handle("/api/mcp/clusters", h.authH.AuthMiddleware(http.HandlerFunc(h.clustersRoot)))
+	mux.Handle("/api/mcp/clusters/", h.authH.AuthMiddleware(http.HandlerFunc(h.clusterByID)))
+}
+
+// middlewareOptions 列出可登记的中间件选项（来自 MIDDLEWARES 配置）。
+func (h *Handler) middlewareOptions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.MethodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, common.MiddlewareList())
+}
+
+// clustersRoot 处理 /api/mcp/clusters 的 POST（新增登记）与 GET（列表）。
+func (h *Handler) clustersRoot(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		h.createCluster(w, r)
+	case http.MethodGet:
+		h.listClusters(w, r)
+	default:
+		common.MethodNotAllowed(w)
+	}
+}
+
+// clusterRequest 集群登记请求体。
+type clusterRequest struct {
+	Middleware  *string `json:"middleware"`
+	ClusterName *string `json:"cluster_name"`
+	DisplayName *string `json:"display_name"`
+	Datacenter  *string `json:"datacenter"`
+	Namesrv     *string `json:"namesrv"`
+	Description *string `json:"description"`
+	Enabled     *bool   `json:"enabled"`
+}
+
+// toClusterResponse 将集群登记转为响应结构。
+func toClusterResponse(c *MiddlewareCluster) map[string]any {
+	return map[string]any{
+		"id":           c.UUID,
+		"middleware":   c.Middleware,
+		"cluster_name": c.ClusterName,
+		"display_name": c.DisplayName,
+		"datacenter":   c.Datacenter,
+		"namesrv":      c.Namesrv,
+		"description":  c.Description,
+		"enabled":      c.Enabled,
+		"created_at":   c.CreatedAt,
+	}
+}
+
+// listClusters 列出全部集群登记（含停用）。
+func (h *Handler) listClusters(w http.ResponseWriter, r *http.Request) {
+	clusters, err := ListMiddlewareClusters(r.Context(), h.db)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	items := make([]map[string]any, 0, len(clusters))
+	for _, c := range clusters {
+		items = append(items, toClusterResponse(c))
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+// createCluster 新增集群登记（同中间件下真实集群名唯一）。
+func (h *Handler) createCluster(w http.ResponseWriter, r *http.Request) {
+	identity := auth.IdentityFromContext(r.Context())
+	if identity == nil || identity.Role != "admin" {
+		common.WriteError(w, common.Forbidden("需要管理员权限"))
+		return
+	}
+	var req clusterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		common.WriteError(w, common.BusinessError("invalid JSON body: "+err.Error()))
+		return
+	}
+	if req.Middleware == nil || req.ClusterName == nil || req.Datacenter == nil ||
+		strings.TrimSpace(*req.Middleware) == "" || strings.TrimSpace(*req.ClusterName) == "" ||
+		strings.TrimSpace(*req.Datacenter) == "" {
+		common.WriteError(w, common.BusinessError("中间件、真实集群名与机房不能为空"))
+		return
+	}
+	// 同中间件下集群名唯一校验
+	clusters, err := ListMiddlewareClusters(r.Context(), h.db)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	mw := strings.ToLower(strings.TrimSpace(*req.Middleware))
+	name := strings.TrimSpace(*req.ClusterName)
+	for _, c := range clusters {
+		if c.Middleware == mw && c.ClusterName == name {
+			common.WriteError(w, common.BusinessError(fmt.Sprintf("集群 %s 已登记（%s）", name, mw)))
+			return
+		}
+	}
+	created, err := CreateMiddlewareCluster(r.Context(), h.db, &MiddlewareCluster{
+		Middleware:  mw,
+		ClusterName: name,
+		DisplayName: strings.TrimSpace(deref(req.DisplayName)),
+		Datacenter:  strings.TrimSpace(*req.Datacenter),
+		Namesrv:     strings.TrimSpace(deref(req.Namesrv)),
+		Description: strings.TrimSpace(deref(req.Description)),
+		Enabled:     true,
+	})
+	if err != nil {
+		common.WriteError(w, common.BusinessError(err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, toClusterResponse(created))
+}
+
+// clusterByID 处理 /api/mcp/clusters/{id} 的 PATCH（更新）与 DELETE（删除）。
+func (h *Handler) clusterByID(w http.ResponseWriter, r *http.Request) {
+	identity := auth.IdentityFromContext(r.Context())
+	if identity == nil || identity.Role != "admin" {
+		common.WriteError(w, common.Forbidden("需要管理员权限"))
+		return
+	}
+	clusterUUID := strings.TrimPrefix(r.URL.Path, "/api/mcp/clusters/")
+	if clusterUUID == "" || strings.Contains(clusterUUID, "/") {
+		common.WriteError(w, common.NotFound("集群登记不存在"))
+		return
+	}
+	switch r.Method {
+	case http.MethodPatch:
+		var req clusterRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			common.WriteError(w, common.BusinessError("invalid JSON body: "+err.Error()))
+			return
+		}
+		updated, err := UpdateMiddlewareCluster(r.Context(), h.db, clusterUUID,
+			req.Middleware, req.ClusterName, req.DisplayName, req.Datacenter,
+			req.Namesrv, req.Description, req.Enabled)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		if updated == nil {
+			common.WriteError(w, common.NotFound("集群登记不存在"))
+			return
+		}
+		writeJSON(w, http.StatusOK, toClusterResponse(updated))
+	case http.MethodDelete:
+		deleted, err := DeleteMiddlewareCluster(r.Context(), h.db, clusterUUID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		if !deleted {
+			common.WriteError(w, common.NotFound("集群登记不存在"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	default:
+		common.MethodNotAllowed(w)
+	}
+}
+
+// deref 取字符串指针的值，nil 返回空串。
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // serversRoot 处理 /api/mcp/servers 的 POST（注册）与 GET（列表）。

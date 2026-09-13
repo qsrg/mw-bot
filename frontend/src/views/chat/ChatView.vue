@@ -51,7 +51,10 @@
             <article v-for="message in messages" :key="message.id" :class="message.role">
               <div class="bubble">
                 <div
-                  v-if="message.role === 'assistant' && message.reasoning"
+                  v-if="
+                    message.role === 'assistant' &&
+                    (message.reasoning || (message.streaming && message.status_received))
+                  "
                   class="reasoning"
                 >
                   <div class="reasoning-header" @click="toggleReasoning(message.id)">
@@ -61,11 +64,20 @@
                     <span>思考过程</span>
                   </div>
                   <div v-show="isReasoningOpen(message.id)" class="reasoning-text">
-                    {{ message.reasoning }}
+                    {{ message.reasoning
+                    }}<span
+                      v-if="message.streaming && !message.reasoning"
+                      class="mw-dot thinking-dot"
+                    ></span>
                   </div>
                 </div>
                 <div
-                  v-if="message.role === 'assistant' && message.streaming && !message.content"
+                  v-if="
+                    message.role === 'assistant' &&
+                    message.streaming &&
+                    !message.content &&
+                    !message.status_received
+                  "
                   class="thinking"
                 >
                   <span class="mw-dot thinking-dot"></span>
@@ -150,6 +162,8 @@ interface ChatMessage {
   used_model_inference?: boolean;
   citations?: Citation[];
   streaming?: boolean;
+  // 已收到 status 事件（会话建立）：流开始即展示思考面板，不必等首个 reasoning
+  status_received?: boolean;
 }
 
 const question = ref("");
@@ -240,7 +254,18 @@ async function submit(): Promise<void> {
   });
   try {
     await sendMessageStream(text, conversationId.value, {
+      onStatus: (conversationIdFromStatus) => {
+        // status 事件在会话建立时立即到达（检索/工具决策之前）：
+        // 立即展开思考面板，新会话即时刷新左侧列表，消除首字前 3-5s 的感知空白
+        messages.value[idx].status_received = true;
+        const isNewConversation = !conversationId.value && !!conversationIdFromStatus;
+        conversationId.value = conversationIdFromStatus;
+        if (isNewConversation) {
+          void loadConversations();
+        }
+      },
       onMeta: (meta) => {
+        // meta 携带引用与推断标识；conversation_id 此前已由 status 设置，此处幂等覆盖
         conversationId.value = meta.conversation_id;
         messages.value[idx].used_model_inference = meta.used_model_inference;
         messages.value[idx].citations = meta.citations;
@@ -261,15 +286,23 @@ async function submit(): Promise<void> {
           ElMessage.warning("本轮长期记忆提取失败，不影响回答内容");
         }
       },
-      onError: () => {
+      onError: (err) => {
         messages.value[idx].streaming = false;
         if (!messages.value[idx].content) {
-          messages.value[idx].content = "请求失败，请稍后重试。";
+          // 空闲超时中止（AbortError）与其他失败给不同文案
+          const msg =
+            err instanceof DOMException && err.name === "AbortError"
+              ? "模型长时间无响应，已中断。请稍后重试。"
+              : "请求失败，请稍后重试。";
+          messages.value[idx].content = msg;
         }
       },
     });
   } finally {
     loading.value = false;
+    // 兜底刷新左侧列表：用户消息与会话在服务端已落库，
+    // 覆盖 meta 前失败等极端路径（onMeta 已刷新过时仅为一次幂等 GET）
+    void loadConversations();
   }
 }
 

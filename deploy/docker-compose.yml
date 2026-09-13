@@ -28,8 +28,8 @@ services:
       ENVIRONMENT: ${ENVIRONMENT:-local}
       # 混合检索开关（dense + BM25 RRF 融合）
       HYBRID_SEARCH: ${HYBRID_SEARCH:-true}
-      # 意图检测开关（LLM 精判，关闭则规则快速通道兜底）
-      INTENT_DETECTION: ${INTENT_DETECTION:-false}
+      # 意图检测开关（LLM 精判，关闭则规则快速通道兜底、未命中一律按知识提问处理）
+      INTENT_DETECTION: ${INTENT_DETECTION:-true}
       # 大模型网关（OpenAI 兼容）— 必填
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:9000/v1}
       LLM_API_KEY: ${LLM_API_KEY}
@@ -42,6 +42,10 @@ services:
       # 检索参数（M27：补齐可经 .env 覆盖的检索/记忆/JWT 配置）
       RETRIEVE_LIMIT: ${RETRIEVE_LIMIT:-5}
       RETRIEVE_SCORE_THRESHOLD: ${RETRIEVE_SCORE_THRESHOLD:-0.3}
+      # 引用质量阈值：dense 余弦分低于此值的弱命中不进引用与 prompt
+      CITATION_SCORE_THRESHOLD: ${CITATION_SCORE_THRESHOLD:-0.4}
+      # 跨中间件歧义探测阈值：应高于主检索阈值，避免弱相关命中误触发反问
+      AMBIGUITY_PROBE_SCORE_THRESHOLD: ${AMBIGUITY_PROBE_SCORE_THRESHOLD:-0.5}
       RERANK_TOP_N: ${RERANK_TOP_N:-5}
       MIDDLEWARES: ${MIDDLEWARES:-rocketmq,kafka,rabbitmq,pulsar,redis,nacos}
       # 会话记忆 token 预算与压缩比例

@@ -268,3 +268,41 @@ func TestChunkKeyPriority(t *testing.T) {
 		t.Errorf("兜底期望 text, 实际 %s", got)
 	}
 }
+
+// TestHybridSearchDenseScorePropagated 验证混合检索结果回填 dense 余弦分：
+// 融合分归一化后不可与余弦阈值比较，下游门控依赖 DenseScore。
+func TestHybridSearchDenseScorePropagated(t *testing.T) {
+	vs := NewInMemoryVectorStore()
+	docs := []Document{
+		{ID: "c1", Text: "堆积处理相关内容", Embedding: []float32{1.0, 0.0},
+			Metadata: map[string]string{"document_id": "d1", "chunk_index": "0"}},
+		{ID: "c2", Text: "堆积处理无关内容", Embedding: []float32{0.0, 1.0},
+			Metadata: map[string]string{"document_id": "d2", "chunk_index": "0"}},
+	}
+	if err := vs.Add(context.Background(), docs); err != nil {
+		t.Fatalf("Add 失败: %v", err)
+	}
+	bm25 := NewBM25Index()
+	bm25.AddDocuments([]BM25Doc{
+		{ID: "c1", Text: "堆积处理相关内容", Metadata: map[string]string{"document_id": "d1", "chunk_index": "0"}},
+		{ID: "c2", Text: "堆积处理无关内容", Metadata: map[string]string{"document_id": "d2", "chunk_index": "0"}},
+	})
+	// 查询向量 (1,0)：c1 余弦 1.0，c2 余弦 0；两路均有命中走 RRF 融合
+	results, err := HybridSearch(context.Background(), vs, bm25, "堆积处理", []float32{1.0, 0.0}, nil, 5, 0)
+	if err != nil {
+		t.Fatalf("HybridSearch 失败: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("期望 2 条, 实际 %d", len(results))
+	}
+	byDoc := map[string]SearchResult{}
+	for _, r := range results {
+		byDoc[r.Metadata["document_id"]] = r
+	}
+	if byDoc["d1"].DenseScore < 0.99 {
+		t.Errorf("d1 DenseScore 应约 1.0, 实际 %f", byDoc["d1"].DenseScore)
+	}
+	if byDoc["d2"].DenseScore != 0 {
+		t.Errorf("d2 DenseScore 应 0（dense 余弦为 0）, 实际 %f", byDoc["d2"].DenseScore)
+	}
+}

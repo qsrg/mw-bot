@@ -28,6 +28,19 @@ type CitationItem struct {
 	Snippet    string  `json:"snippet"`     // 摘要片段（默认空串）
 }
 
+// ToolApprovalRequiredError agent loop 自动调用遇到需二次确认的工具时返回，
+// 由会话层转交互式审批流（携带工具标识与本次拟执行的入参）。
+type ToolApprovalRequiredError struct {
+	ToolID    int64
+	ToolName  string
+	Arguments map[string]any
+}
+
+// Error 实现 error 接口。
+func (e *ToolApprovalRequiredError) Error() string {
+	return fmt.Sprintf("工具 %s 需要二次确认", e.ToolName)
+}
+
 // RagAnswer RAG 答案，含内容、引用、模型推断标识与工具调用记录。
 // 与 Python RagAnswer dataclass 对齐。
 type RagAnswer struct {
@@ -116,21 +129,22 @@ func (s *RagService) Retrieve(ctx context.Context, question string, limit int, f
 	if len(embeddings) == 0 {
 		return nil, fmt.Errorf("embedding returned empty result")
 	}
-	return s.search(ctx, question, embeddings[0], filters, limit)
+	return s.search(ctx, question, embeddings[0], filters, limit, s.settings.RetrieveScoreThreshold)
 }
 
 // search 按已向量化的问题检索知识库（混合/纯向量）。
 // score_threshold 按余弦相似度在融合前过滤无关片段（作用于 dense 路）。
-// 供 retrieve 与 prepare 的逐中间件歧义检测复用，避免重复 embedding 调用。
-func (s *RagService) search(ctx context.Context, question string, queryEmbedding []float32, filters map[string]string, limit int) ([]common.SearchResult, error) {
+// 供 retrieve、prepare 的主检索与逐中间件歧义探测复用，避免重复 embedding 调用；
+// 歧义探测调用方传入更高的阈值，避免弱相关命中误触发反问。
+func (s *RagService) search(ctx context.Context, question string, queryEmbedding []float32, filters map[string]string, limit int, threshold float64) ([]common.SearchResult, error) {
 	ft := filters
 	if ft == nil {
 		ft = map[string]string{}
 	}
 	if s.settings.HybridSearch {
-		return s.vector.HybridSearch(ctx, question, queryEmbedding, ft, limit, s.settings.RetrieveScoreThreshold)
+		return s.vector.HybridSearch(ctx, question, queryEmbedding, ft, limit, threshold)
 	}
-	return s.vector.SimilaritySearch(ctx, queryEmbedding, ft, limit, s.settings.RetrieveScoreThreshold)
+	return s.vector.SimilaritySearch(ctx, queryEmbedding, ft, limit, threshold)
 }
 
 // buildCitations 将检索结果拼装为前端展示用的引用结构（文件名、分数、摘要）。
@@ -425,11 +439,15 @@ func (s *RagService) prepare(
 		queryEmbedding := embeddings[0]
 
 		// 跨中间件歧义：提问未指定中间件时，逐个中间件过滤检索看是否有命中。
+		// 探测走纯向量检索（不走 HybridSearch）：RRF 融合分被归一化到 [0,1] 且不与阈值比较，
+		// BM25 弱命中（如"使用/回答"等高频词）会绕过阈值导致误触发；
+		// 纯向量余弦分与 AmbiguityProbeScoreThreshold（高于主检索阈值）语义匹配，
+		// 泛化提问（如风格指令）弱命中不再算数。
 		// 反问上下文下不再触发反问（无论是否匹配候选），避免反复追问用户。
 		if intent == "knowledge" && len(qMws) == 0 && len(clarificationCandidates) == 0 {
 			relevantMws := []string{}
 			for _, mw := range common.MiddlewareList() {
-				hits, err := s.search(ctx, retrieveQ, queryEmbedding, map[string]string{"mw_" + mw: "true"}, 3)
+				hits, err := s.vector.SimilaritySearch(ctx, queryEmbedding, map[string]string{"mw_" + mw: "true"}, 3, s.settings.AmbiguityProbeScoreThreshold)
 				if err != nil {
 					slog.WarnContext(ctx, "逐中间件检索失败", "middleware", mw, "error", err)
 					continue
@@ -444,7 +462,7 @@ func (s *RagService) prepare(
 		}
 
 		if clarification == nil {
-			results, err := s.search(ctx, retrieveQ, queryEmbedding, filters, s.settings.RetrieveLimit)
+			results, err := s.search(ctx, retrieveQ, queryEmbedding, filters, s.settings.RetrieveLimit, s.settings.RetrieveScoreThreshold)
 			if err != nil {
 				return nil, fmt.Errorf("search knowledge base: %w", err)
 			}
@@ -452,8 +470,12 @@ func (s *RagService) prepare(
 			if len(reranked) > s.settings.RerankTopN {
 				reranked = reranked[:s.settings.RerankTopN]
 			}
-			citations = s.buildCitations(reranked)
-			context := joinTexts(reranked, "\n\n")
+			// 引用质量门控：按 dense 余弦分过滤弱命中，防止语义相邻但无答案的片段
+			// （如问 ZooKeeper 召回 Kafka 文档）进入引用列表与 prompt。
+			// 混合检索下 Score 是 RRF 融合分（恒归一化），故门控用 DenseScore。
+			relevant := filterByDenseScore(reranked, s.settings.CitationScoreThreshold)
+			citations = s.buildCitations(relevant)
+			context := joinTexts(relevant, "\n\n")
 			// 无引用且无工具结果时，LLM 只能靠自身知识回答，标记为模型推断
 			usedModelInference = len(citations) == 0 && !hasToolResults
 			if context != "" {
@@ -509,6 +531,17 @@ func joinTexts(results []common.SearchResult, sep string) string {
 	return strings.Join(parts, sep)
 }
 
+// filterByDenseScore 过滤 dense 余弦分低于阈值的弱命中，供引用质量门控使用。
+func filterByDenseScore(results []common.SearchResult, threshold float64) []common.SearchResult {
+	out := make([]common.SearchResult, 0, len(results))
+	for _, r := range results {
+		if r.DenseScore >= threshold {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // sortedStrings 返回排序后的字符串切片副本。
 func sortedStrings(in []string) []string {
 	out := append([]string(nil), in...)
@@ -527,6 +560,7 @@ func (s *RagService) decideToolCall(
 	tools []ToolDef,
 	history []common.Message,
 	priorResults []string,
+	registryContext string,
 ) map[string]any {
 	// 拼装工具列表行
 	toolLines := make([]string, 0, len(tools))
@@ -538,11 +572,26 @@ func (s *RagService) decideToolCall(
 	if len(priorResults) > 0 {
 		priorBlock = "已获取的工具结果:\n" + strings.Join(priorResults, "\n\n") + "\n\n"
 	}
+	// 集群注册表（维护于系统数据库）注入决策 prompt，供中间件/机房/别名映射
+	registryBlock := ""
+	if strings.TrimSpace(registryContext) != "" {
+		registryBlock = "集群注册表（维护于系统数据库，中间件 / 机房 -> 集群名）:\n" +
+			registryContext + "\n\n" +
+			"集群查询规则：\n" +
+			"- 用户询问集群节点/主从等信息时，优先调用对应查询工具；\n" +
+			"- 注册表按 中间件 / 机房 / 集群 登记条目：先按问题中提到的中间件过滤，再按机房与集群别名定位；\n" +
+			"- 用户以业务别名指集群时，按注册表映射为真实集群名（括号内）后再作为工具入参，不要编造集群名；\n" +
+			"- 用户指定的机房/集群未登记时，告知未登记并请其确认；\n" +
+			"- 消费组状态/堆积查询不需要用户提供 topic，缺 topic 时直接调用工具（省略 topic 参数）；\n" +
+			"- 未指明中间件/机房/集群（或同范围内有多个可选而用户未指明具体哪个）时，不要猜测，输出：\n" +
+			"  {\"need_tool\": false, \"clarification\": \"请告知您要查询哪个中间件/机房/集群？当前已登记: <列表>\"}\n" +
+			"- 仅当问题确实涉及集群/实例等需要实时数据的查询时才走以上规则，普通知识提问不要输出 clarification。\n\n"
+	}
 	// 替换 system prompt 占位符
 	sysPrompt := strings.Replace(toolDecisionSystemPrompt, "{tool_lines}", strings.Join(toolLines, "\n"), 1)
 	messages := []common.Message{
 		{Role: "system", Content: sysPrompt},
-		{Role: "user", Content: priorBlock + "用户问题：" + question},
+		{Role: "user", Content: registryBlock + priorBlock + "用户问题：" + question},
 	}
 	raw, err := s.llm.Chat(ctx, messages)
 	if err != nil {
@@ -559,14 +608,19 @@ func parseToolDecision(raw string, tools []ToolDef) map[string]any {
 		return nil
 	}
 	var data struct {
-		NeedTool  bool           `json:"need_tool"`
-		Tool      string         `json:"tool"`
-		Arguments map[string]any `json:"arguments"`
+		NeedTool      bool           `json:"need_tool"`
+		Tool          string         `json:"tool"`
+		Arguments     map[string]any `json:"arguments"`
+		Clarification string         `json:"clarification"`
 	}
 	if err := json.Unmarshal([]byte(match), &data); err != nil {
 		return nil
 	}
 	if !data.NeedTool {
+		// 信息不足反问：决策模型给出反问文案，由会话层直接返回用户
+		if c := strings.TrimSpace(data.Clarification); c != "" {
+			return map[string]any{"clarification": c}
+		}
 		return nil
 	}
 	if data.Tool == "" {
@@ -602,14 +656,19 @@ func (s *RagService) RunToolLoop(
 	tools []ToolDef,
 	executor ToolExecutor,
 	history []common.Message,
-) ([]string, []map[string]any) {
+	registryContext string,
+) ([]string, []map[string]any, string, error) {
 	resultBlocks := []string{}
 	toolCalls := []map[string]any{}
 	prior := []string{}
 	for i := 0; i < MAX_TOOL_ITERATIONS; i++ {
-		decision := s.decideToolCall(ctx, question, tools, history, prior)
+		decision := s.decideToolCall(ctx, question, tools, history, prior, registryContext)
 		if decision == nil {
 			break
+		}
+		// 决策模型判定信息不足：返回反问文案，由会话层直接答复
+		if c, ok := decision["clarification"].(string); ok && c != "" {
+			return nil, nil, c, nil
 		}
 		toolName, _ := decision["tool"].(string)
 		arguments, _ := decision["arguments"].(map[string]any)
@@ -620,6 +679,11 @@ func (s *RagService) RunToolLoop(
 		var resultText string
 		output, err := executor(ctx, toolName, arguments)
 		if err != nil {
+			// 需二次确认的工具：透传给会话层转交互式审批流，不作为错误吞掉
+			var appr *ToolApprovalRequiredError
+			if errors.As(err, &appr) {
+				return nil, nil, "", appr
+			}
 			slog.WarnContext(ctx, "工具执行失败", "tool", toolName, "error", err)
 			output = map[string]any{"error": err.Error()}
 			resultText = "工具调用失败: " + err.Error()
@@ -637,7 +701,7 @@ func (s *RagService) RunToolLoop(
 			"result":    output,
 		})
 	}
-	return resultBlocks, toolCalls
+	return resultBlocks, toolCalls, "", nil
 }
 
 // Answer 基于知识库检索结果生成答案，并返回引用与推断标识。
@@ -655,7 +719,14 @@ func (s *RagService) Answer(
 ) (*RagAnswer, error) {
 	prep, err := s.prepare(ctx, question, history, memories, toolResults)
 	if err != nil {
-		return nil, err
+		// 检索/向量化失败降级为兜底回复，避免问答整体 500（对齐流式路径）
+		slog.WarnContext(ctx, "检索准备失败，降级为兜底回复", "error", err)
+		return &RagAnswer{
+			Content:            FallbackAnswer,
+			Citations:          []CitationItem{},
+			UsedModelInference: false,
+			ToolCalls:          toolCalls,
+		}, nil
 	}
 	if len(prep.Clarification) > 0 {
 		content := clarificationPrefix + strings.Join(prep.Clarification, "、") + clarificationSuffix

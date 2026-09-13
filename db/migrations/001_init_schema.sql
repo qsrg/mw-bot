@@ -1,6 +1,8 @@
 -- 企业内部智能问答系统初始化 schema（MySQL 8，UTF8MB4）
 -- 主键统一 INT 自增；uuid 为对外标识扩展字段，用于 object_key 等不可枚举场景
--- 通过手写版本化 SQL 管理，不使用 Alembic；ORM model 与本脚本必须同步变更
+-- 本脚本为唯一权威建表入口：包含全部表结构、索引与示例数据的最终形态，
+-- 全新环境执行本文件即可完成建库建表（IF NOT EXISTS 幂等）。
+-- 通过手写 SQL 管理，不使用 Alembic；model/结构体与本脚本必须同步变更
 
 CREATE DATABASE IF NOT EXISTS ai_qa DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE ai_qa;
@@ -128,7 +130,10 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   name VARCHAR(128) NOT NULL UNIQUE COMMENT '名称',
   base_url VARCHAR(1024) NOT NULL COMMENT '地址',
   enabled TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否启用',
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间'
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  -- base_url 前缀唯一索引：utf8mb4 下整列超出 InnoDB 3072 字节键长限制，
+  -- 767 字符前缀足够覆盖实际 URL 长度，语义不受影响
+  UNIQUE KEY uq_mcp_server_base_url (base_url(767))
 ) COMMENT='MCP Server 注册';
 
 -- MCP 工具策略表
@@ -169,3 +174,57 @@ CREATE TABLE IF NOT EXISTS audit_events (
   INDEX idx_audit_type_created (event_type, created_at),
   INDEX idx_audit_actor_created (actor_user_id, created_at)
 ) COMMENT='审计事件';
+
+-- 中间件集群注册表（中间件无关：rocketmq/kafka/rabbitmq/pulsar/redis/nacos 等）
+-- 供 MCP 工具决策使用：把用户口中的"中间件/机房/集群业务别名"映射为真实集群名；
+-- cluster_name 为真实集群名（组件配置中的名字，MCP 工具入参），display_name 为
+-- 用户可读别名（可与真实名不同，为空按真实名匹配）；连接地址（rocketmq 为
+-- NameServer）为权威连接信息，调用工具时由会话层解析注入；同一连接地址下
+-- 多个集群表现为多行登记共用同一地址。
+CREATE TABLE IF NOT EXISTS middleware_clusters (
+  id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()) COMMENT '对外标识',
+  middleware VARCHAR(64) NOT NULL COMMENT '所属中间件（rocketmq/kafka/...）',
+  cluster_name VARCHAR(128) NOT NULL COMMENT '真实集群名（组件配置中的名字，MCP 工具入参）',
+  display_name VARCHAR(128) NULL COMMENT '集群业务别名（用户可读，为空时按 cluster_name 匹配）',
+  datacenter VARCHAR(64) NOT NULL COMMENT '机房标识（如 bj10）',
+  namesrv VARCHAR(255) NOT NULL DEFAULT '' COMMENT '连接地址（权威连接信息，调用工具时注入）',
+  description VARCHAR(512) NOT NULL DEFAULT '' COMMENT '说明',
+  enabled TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否启用（停用后不参与映射与反问）',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  UNIQUE KEY uk_middleware_cluster (middleware, cluster_name),
+  KEY idx_middleware_clusters_dc (middleware, datacenter)
+) COMMENT='中间件集群注册表（集群基础信息人工维护）';
+
+-- 集群登记示例数据（幂等：按 middleware+cluster_name 去重，可按实际环境修改或停用）
+INSERT INTO middleware_clusters (uuid, middleware, cluster_name, display_name, datacenter, namesrv, description)
+SELECT UUID(), t.middleware, t.cluster_name, t.display_name, t.datacenter, t.namesrv, t.description
+FROM (
+  SELECT 'rocketmq' AS middleware, 'DefaultCluster' AS cluster_name, 'DefaultCluster' AS display_name,
+         'bj10' AS datacenter, 'localhost:9876' AS namesrv,
+         'bj10 机房 RocketMQ 集群（示例，请按实际环境维护）' AS description
+) t
+WHERE NOT EXISTS (
+  SELECT 1 FROM middleware_clusters
+  WHERE middleware = t.middleware AND cluster_name = t.cluster_name
+);
+
+-- 会话内待二次确认的 MCP 工具调用暂存表
+-- agent loop 遇到 requires_approval 工具时暂存调用，用户在聊天里回复「确认/取消」
+-- 完成交互式审批；状态机 pending/executed/cancelled/expired，executed 仅一次
+-- （防重放），超过 expires_at 未处理视为过期作废。
+CREATE TABLE IF NOT EXISTS pending_tool_calls (
+  id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()) COMMENT '对外标识',
+  conversation_id INT NOT NULL COMMENT '所属会话(conversations.id)',
+  tool_id INT NOT NULL COMMENT 'MCP 工具ID(mcp_tools.id)',
+  tool_name VARCHAR(255) NOT NULL COMMENT '工具名',
+  arguments JSON NOT NULL COMMENT '拟执行入参',
+  question TEXT NOT NULL COMMENT '触发审批的原始用户问题',
+  status VARCHAR(16) NOT NULL DEFAULT 'pending' COMMENT '状态：pending/executed/cancelled/expired',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  expires_at DATETIME NOT NULL COMMENT '确认截止时间',
+  resolved_at DATETIME NULL COMMENT '处理时间',
+  KEY idx_pending_conversation (conversation_id, status)
+) COMMENT='会话内待二次确认的 MCP 工具调用暂存';

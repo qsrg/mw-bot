@@ -42,18 +42,18 @@ frontend/                   Vue 3 前端（
 
 ## 数据库初始化
 
-迁移约定：`001_init_schema.sql` 始终保持**最新全量结构**；`002+` 为增量迁移，
-供已有数据库升级用。增量迁移均做了幂等处理（`information_schema` 守卫 + 动态 SQL，
-兼容 MySQL 8），已包含的变更会输出 `skip` 并跳过，重复执行不报错。
+迁移约定：`001_init_schema.sql` 为**单文件全量初始化脚本**（全部表结构、索引与
+集群登记示例数据的最终形态），全新环境执行本文件即可完成建库建表；
+`IF NOT EXISTS` + 种子去重守卫保证幂等，重复执行不报错。
+含集群注册表（`middleware_clusters`：中间件/机房/业务别名/连接地址）与问答内
+工具审批的暂存表（`pending_tool_calls`）。
 
 ```bash
-# 1. 全新数据库：只需 001 + 002
-#    （003/004 的列已并入 001；即使按序全跑 001~004 也安全，003/004 会自动跳过）
+# 1. 全新数据库：仅执行 001
 mysql -h 127.0.0.1 -uroot -p < db/migrations/001_init_schema.sql
-mysql -h 127.0.0.1 -uroot -p < db/migrations/002_mcp_server_base_url_unique.sql
 
-# 2. 已有数据库升级：按序补跑尚未执行的迁移（重复执行自动跳过）
-#    mysql -h 127.0.0.1 -uroot -p ai_qa < db/migrations/00N_xxx.sql
+# 2. 已有数据库升级（001-004 合并前的存量库）：补跑集群注册表与审批暂存表
+#    mysql -h 127.0.0.1 -uroot -p ai_qa < db/migrations/001_init_schema.sql
 
 # 3. 建应用账号
 mysql -h 127.0.0.1 -uroot -p -e "CREATE USER IF NOT EXISTS 'ai_qa'@'%' IDENTIFIED BY 'ai_qa'; GRANT ALL ON ai_qa.* TO 'ai_qa'@'%'; FLUSH PRIVILEGES;"

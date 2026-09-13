@@ -18,10 +18,16 @@
           <el-icon><Document /></el-icon>
           <span>文档管理</span>
         </el-menu-item>
-        <el-menu-item index="/admin/tools">
+        <el-sub-menu index="/admin/tools-group">
+          <template #title>
+            
           <el-icon><SetUp /></el-icon>
           <span>工具管理</span>
-        </el-menu-item>
+        
+          </template>
+          <el-menu-item index="/admin/tools">服务与工具</el-menu-item>
+          <el-menu-item index="/admin/clusters">集群信息</el-menu-item>
+        </el-sub-menu>
         <el-menu-item index="/admin/memories">
           <el-icon><Collection /></el-icon>
           <span>记忆管理</span>

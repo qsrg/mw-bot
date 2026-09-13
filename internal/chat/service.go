@@ -219,7 +219,7 @@ func (s *ChatService) loadHistory(ctx context.Context, conversationID int64) ([]
 
 // buildToolContext 加载启用的 MCP 工具，构造工具定义与执行回调。
 // 无启用工具时返回 ([], nil)，RagService 将走纯知识库流程。
-func (s *ChatService) buildToolContext(ctx context.Context, userID int64, userRole string) ([]rag.ToolDef, rag.ToolExecutor) {
+func (s *ChatService) buildToolContext(ctx context.Context, userID int64, userRole string, confirmed bool) ([]rag.ToolDef, rag.ToolExecutor) {
 	tools, err := mcp_gateway.ListEnabledTools(ctx, s.db)
 	if err != nil {
 		slog.WarnContext(ctx, "加载启用工具失败，按无工具处理", "error", err)
@@ -258,8 +258,20 @@ func (s *ChatService) buildToolContext(ctx context.Context, userID int64, userRo
 		if server == nil {
 			return nil, fmt.Errorf("工具 %s 所属 Server 不可用", toolName)
 		}
-		// confirmed=false：requires_approval 的工具在 agent 自动调用时按拒绝处理
-		rec, err := gw.InvokeTool(ctx, tool, server, arguments, userID, userRole, false)
+		// 需二次确认的工具在 agent 自动调用时转交互式审批流（角色允许时）；
+		// 显式确认执行（confirmed=true）或无需确认时经网关正常调用
+		if !confirmed && tool.RequiresApproval && containsString(tool.AllowedRoles, userRole) {
+			return nil, &rag.ToolApprovalRequiredError{
+				ToolID: tool.ID, ToolName: tool.ToolName, Arguments: arguments,
+			}
+		}
+		// RocketMQ 工具：集群连接地址由集群注册表（数据库维护）解析后注入入参，
+		// 未登记的集群无法获取地址，直接报错交由回答说明
+		arguments, err = s.injectClusterAddress(ctx, toolName, arguments)
+		if err != nil {
+			return nil, err
+		}
+		rec, err := gw.InvokeTool(ctx, tool, server, arguments, userID, userRole, confirmed)
 		if err != nil {
 			return nil, err
 		}
@@ -276,6 +288,179 @@ func (s *ChatService) buildToolContext(ctx context.Context, userID int64, userRo
 		return output, nil
 	}
 	return toolDefs, executor
+}
+
+// injectClusterAddress RocketMQ 工具入参注入集群注册表中登记的真实连接地址。
+//
+// 工具入参的 cluster 为真实集群名；决策模型若误传业务别名（display_name）
+// 也按别名回退解析并归一为真实集群名。非 RocketMQ 工具或不含 cluster 入参时原样返回。
+func (s *ChatService) injectClusterAddress(ctx context.Context, toolName string, arguments map[string]any) (map[string]any, error) {
+	if !strings.HasPrefix(toolName, "rocketmq_") {
+		return arguments, nil
+	}
+	name, _ := arguments["cluster"].(string)
+	if strings.TrimSpace(name) == "" {
+		return arguments, nil
+	}
+	cluster, err := mcp_gateway.GetMiddlewareClusterByName(ctx, s.db, name)
+	if err != nil {
+		return nil, err
+	}
+	if cluster == nil {
+		return nil, fmt.Errorf("集群 %s 未在集群注册表登记，无法获取连接地址", name)
+	}
+	out := make(map[string]any, len(arguments)+2)
+	for k, v := range arguments {
+		out[k] = v
+	}
+	out["cluster"] = cluster.ClusterName
+	if cluster.Namesrv != "" {
+		out["namesrv"] = cluster.Namesrv
+	}
+	return out, nil
+}
+
+// loadClusterRegistry 加载启用的中间件集群注册表，格式化为工具决策用文本块。
+//
+// 别名与真实集群名相同时只展示一次；未登记任何启用集群时返回空串（不注入）。
+func (s *ChatService) loadClusterRegistry(ctx context.Context) string {
+	clusters, err := mcp_gateway.ListEnabledMiddlewareClusters(ctx, s.db)
+	if err != nil {
+		slog.WarnContext(ctx, "加载集群注册表失败，不注入决策 prompt", "error", err)
+		return ""
+	}
+	lines := make([]string, 0, len(clusters))
+	for _, c := range clusters {
+		namePart := c.ClusterName
+		if alias := strings.TrimSpace(c.DisplayName); alias != "" && alias != c.ClusterName {
+			namePart = fmt.Sprintf("%s（真实集群名: %s）", alias, c.ClusterName)
+		}
+		line := fmt.Sprintf("- %s / %s 机房: %s", c.Middleware, c.Datacenter, namePart)
+		if c.Namesrv != "" {
+			line += fmt.Sprintf("（连接地址: %s）", c.Namesrv)
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// resolvePendingToolCall 处理会话内待确认的工具调用，返回本轮处理结果。
+//
+// - 无待确认（或已过期）：正常流程；
+// - 回复确认：以 confirmed=true 执行暂存的调用（防重放：状态机置 executed）；
+// - 回复取消：作废并直接回复已取消；
+// - 其他输入：忽略本次待确认请求（作废），按新问题正常处理。
+func (s *ChatService) resolvePendingToolCall(ctx context.Context, conversationID int64, userReply string, userID int64, userRole string) *pendingOutcome {
+	// 过期未处理的暂存先标记 expired（不再参与确认）
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE pending_tool_calls SET status = 'expired', resolved_at = NOW()
+		 WHERE conversation_id = ? AND status = 'pending' AND expires_at <= NOW()`,
+		conversationID); err != nil {
+		slog.WarnContext(ctx, "标记过期待确认记录失败", "error", err)
+	}
+	outcome := &pendingOutcome{}
+	var (
+		id        int64
+		toolName  string
+		arguments []byte
+		question  string
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, tool_name, arguments, question FROM pending_tool_calls
+		 WHERE conversation_id = ? AND status = 'pending' AND expires_at > NOW()
+		 ORDER BY id DESC LIMIT 1`,
+		conversationID).Scan(&id, &toolName, &arguments, &question)
+	if err != nil {
+		return outcome // 无待确认记录
+	}
+	reply := strings.ToLower(strings.TrimSpace(userReply))
+	if cancelWords[reply] {
+		s.cancelPending(ctx, id)
+		outcome.directReply = "已取消执行工具 " + toolName + "。"
+		return outcome
+	}
+	if confirmWords[reply] {
+		_, toolExecutor := s.buildToolContext(ctx, userID, userRole, true)
+		if toolExecutor == nil {
+			s.cancelPending(ctx, id)
+			outcome.directReply = "工具 " + toolName + " 已不可用，本次请求已作废。"
+			return outcome
+		}
+		var args map[string]any
+		if len(arguments) > 0 {
+			if err := json.Unmarshal(arguments, &args); err != nil {
+				args = map[string]any{}
+			}
+		}
+		output, execErr := toolExecutor(ctx, toolName, args)
+		if execErr != nil {
+			// 执行失败即作废，回复失败原因（不含堆栈）
+			s.cancelPending(ctx, id)
+			outcome.directReply = fmt.Sprintf("工具 %s 执行失败：%v", toolName, execErr)
+			return outcome
+		}
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE pending_tool_calls SET status = 'executed', resolved_at = NOW() WHERE id = ?`,
+			id); err != nil {
+			slog.WarnContext(ctx, "更新待确认记录状态失败", "error", err)
+		}
+		resultText, _ := json.Marshal(output)
+		argsJSON, _ := json.Marshal(args)
+		outcome.toolResults = []string{
+			fmt.Sprintf("工具 %s（参数 %s）返回:\n%s", toolName, string(argsJSON), string(resultText)),
+		}
+		outcome.toolCalls = []map[string]any{
+			{"tool": toolName, "arguments": args, "result": output},
+		}
+		outcome.ragQuestion = question
+		return outcome
+	}
+	// 其他输入：忽略本次待确认请求，按新问题正常处理
+	s.cancelPending(ctx, id)
+	return outcome
+}
+
+// cancelPending 将指定待确认记录作废。
+func (s *ChatService) cancelPending(ctx context.Context, id int64) {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE pending_tool_calls SET status = 'cancelled', resolved_at = NOW() WHERE id = ?`,
+		id); err != nil {
+		slog.WarnContext(ctx, "作废待确认记录失败", "error", err)
+	}
+}
+
+// handleApprovalRequired 创建待确认工具调用的暂存记录，返回确认提示文案。
+//
+// 同会话此前的待确认请求一并作废，仅保留最新一次；有效期 pendingTTLMinutes 分钟。
+func (s *ChatService) handleApprovalRequired(ctx context.Context, conversationID int64, question string, approval *rag.ToolApprovalRequiredError) string {
+	now := time.Now()
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE pending_tool_calls SET status = 'cancelled', resolved_at = NOW()
+		 WHERE conversation_id = ? AND status = 'pending'`,
+		conversationID); err != nil {
+		slog.WarnContext(ctx, "作废旧待确认记录失败", "error", err)
+	}
+	argsJSON, _ := json.Marshal(approval.Arguments)
+	expires := now.Add(pendingTTLMinutes * time.Minute)
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO pending_tool_calls (uuid, conversation_id, tool_id, tool_name, arguments, question, status, expires_at)
+		 VALUES (UUID(), ?, ?, ?, ?, ?, 'pending', ?)`,
+		conversationID, approval.ToolID, approval.ToolName, string(argsJSON), question, expires); err != nil {
+		slog.WarnContext(ctx, "创建待确认记录失败", "error", err)
+	}
+	return fmt.Sprintf(
+		"即将调用需二次确认的工具 `%s`（参数：%s）。\n回复「确认」执行、「取消」放弃（%d 分钟内有效）；发送其他内容将忽略本次请求。",
+		approval.ToolName, string(argsJSON), pendingTTLMinutes)
+}
+
+// _loadHistoryPlaceholder 占位
+func containsString(list []string, role string) bool {
+	for _, item := range list {
+		if item == role {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeInputSchema 将 InputSchema 归一化为 map[string]any。
@@ -333,20 +518,85 @@ func (s *ChatService) Ask(
 		return nil, common.SystemError(err)
 	}
 
-	// agent loop
-	toolDefs, toolExecutor := s.buildToolContext(ctx, userID, userRole)
-	var toolResults []string
-	var toolCalls []map[string]any
-	if toolExecutor != nil {
-		toolResults, toolCalls = s.rag.RunToolLoop(ctx, question, toolDefs, toolExecutor, history)
+	// 会话内待确认的 MCP 工具调用：确认→执行一次；取消→作废；其他输入→忽略
+	pendingOut := s.resolvePendingToolCall(ctx, conv.ID, question, userID, userRole)
+	if pendingOut.directReply != "" {
+		msg, memoryFailed, err := s.persistAssistant(ctx, conv.ID, conv.UUID, pendingOut.directReply,
+			nil, false, userID, userRole, question, true)
+		if err != nil {
+			return nil, err
+		}
+		return &AskResult{
+			Conversation: conv,
+			Message:      msg,
+			RagAnswer: &rag.RagAnswer{
+				Content:            pendingOut.directReply,
+				Citations:          []rag.CitationItem{},
+				UsedModelInference: false,
+			},
+			MemoryExtractionFailed: memoryFailed,
+		}, nil
+	}
+	ragQuestion := question
+	toolResults, toolCalls := pendingOut.toolResults, pendingOut.toolCalls
+	if len(toolResults) == 0 {
+		// agent loop（工具决策的 LLM 调用）；注册表注入决策 prompt
+		toolDefs, toolExecutor := s.buildToolContext(ctx, userID, userRole, false)
+		if toolExecutor != nil {
+			var approvalErr *rag.ToolApprovalRequiredError
+			var clarification string
+			var runErr error
+			toolResults, toolCalls, clarification, runErr = s.rag.RunToolLoop(ctx, question, toolDefs, toolExecutor, history,
+				s.loadClusterRegistry(ctx))
+			if runErr != nil {
+				if errors.As(runErr, &approvalErr) {
+					// 需二次确认的工具：暂存调用并反问用户，不执行
+					prompt := s.handleApprovalRequired(ctx, conv.ID, question, approvalErr)
+					msg, memoryFailed, pErr := s.persistAssistant(ctx, conv.ID, conv.UUID, prompt,
+						nil, false, userID, userRole, question, true)
+					if pErr != nil {
+						return nil, pErr
+					}
+					return &AskResult{
+						Conversation: conv,
+						Message:      msg,
+						RagAnswer: &rag.RagAnswer{
+							Content:            prompt,
+							Citations:          []rag.CitationItem{},
+							UsedModelInference: false,
+						},
+						MemoryExtractionFailed: memoryFailed,
+					}, nil
+				}
+				return nil, common.SystemError(runErr)
+			}
+			if clarification != "" {
+				// 决策模型判定信息不足：直接反问，不走 RAG 回答
+				msg, memoryFailed, pErr := s.persistAssistant(ctx, conv.ID, conv.UUID, clarification,
+					nil, false, userID, userRole, question, false)
+				if pErr != nil {
+					return nil, pErr
+				}
+				return &AskResult{
+					Conversation: conv,
+					Message:      msg,
+					RagAnswer: &rag.RagAnswer{
+						Content:            clarification,
+						Citations:          []rag.CitationItem{},
+						UsedModelInference: false,
+					},
+					MemoryExtractionFailed: memoryFailed,
+				}, nil
+			}
+		}
 	}
 
-	ragAnswer, err := s.rag.Answer(ctx, question, history, memories, toolResults, toolCalls)
+	ragAnswer, err := s.rag.Answer(ctx, ragQuestion, history, memories, toolResults, toolCalls)
 	if err != nil {
 		return nil, err
 	}
 
-	msg, memoryFailed, err := s.persistAssistant(ctx, conv.ID, conv.UUID, ragAnswer.Content, ragAnswer.Citations, ragAnswer.UsedModelInference, userID, userRole, question)
+	msg, memoryFailed, err := s.persistAssistant(ctx, conv.ID, conv.UUID, ragAnswer.Content, ragAnswer.Citations, ragAnswer.UsedModelInference, userID, userRole, question, false)
 	if err != nil {
 		return nil, err
 	}
@@ -391,6 +641,7 @@ func (s *ChatService) persistAssistant(
 	usedModelInference bool,
 	userID int64,
 	userRole, question string,
+	skipMemory bool,
 ) (*Message, bool, error) {
 	assistantID, assistantUUID, err := InsertMessage(ctx, s.db, conversationID, "assistant", content, usedModelInference)
 	if err != nil {
@@ -447,7 +698,7 @@ func (s *ChatService) persistAssistant(
 	// 问答完成后提取长期记忆；兜底回复与反问模板跳过（见 shouldExtractMemory）。
 	// 提取失败不影响已完成的问答结果，仅向上返回供 API 层提示用户。
 	memoryFailed := false
-	if shouldExtractMemory(content) {
+	if !skipMemory && shouldExtractMemory(content) {
 		memSvc := NewMemoryService(s.db, s.rag.LLMProvider(), s.audit)
 		if _, memErr := memSvc.ExtractAndSave(ctx, userID, question, content, userRole); memErr != nil {
 			slog.WarnContext(ctx, "长期记忆提取失败", "user_id", userID, "error", memErr)
@@ -472,6 +723,32 @@ func (s *ChatService) persistAssistant(
 // answer_style 类偏好（如"记住用中文回答"）正是通过 chat 意图轮次表达的。
 func shouldExtractMemory(content string) bool {
 	return content != rag.FallbackAnswer && !rag.IsClarification(content)
+}
+
+// 待审批工具调用的确认有效期与确认/取消词表。
+const pendingTTLMinutes = 10
+
+// confirmWords 确认词表（回复精确匹配）。
+var confirmWords = map[string]bool{
+	"确认": true, "确定": true, "同意": true, "是": true, "好": true, "好的": true,
+	"ok": true, "yes": true, "执行": true, "继续": true,
+}
+
+// cancelWords 取消词表（回复精确匹配）。
+var cancelWords = map[string]bool{
+	"取消": true, "不": true, "不用": true, "不要": true, "算了": true, "否": true,
+	"no": true, "放弃": true,
+}
+
+// pendingOutcome 待审批工具调用的处理结果（对齐 Python _PendingOutcome）。
+//
+// directReply 非空时直接以该内容回复（取消/等待/失败/审批提示，不走 RAG）；
+// toolResults 非空表示已按用户确认执行完工具，ragQuestion 为触发审批的原始问题。
+type pendingOutcome struct {
+	directReply string
+	toolResults []string
+	toolCalls   []map[string]any
+	ragQuestion string
 }
 
 // compressHistoryIfNeeded 超 token 预算时压缩会话历史：折叠最旧消息进摘要、推进边界。
@@ -560,9 +837,10 @@ func (s *ChatService) summarizeMessages(ctx context.Context, existingSummary str
 }
 
 // StreamEvent 流式问答事件，与前端约定一致。
-// Type 取值 meta/reasoning/delta/done。
+// Type 取值 status/meta/reasoning/delta/done；status 在会话建立后立即发出，
+// 供前端提前进入思考态。
 type StreamEvent struct {
-	Type                   string         `json:"type"`                               // 事件类型：meta/reasoning/delta/done
+	Type                   string         `json:"type"`                               // 事件类型：status/meta/reasoning/delta/done
 	ConversationID         string         `json:"conversation_id,omitempty"`          // meta：会话 uuid
 	Citations              []CitationItem `json:"citations,omitempty"`                // meta：引用列表
 	UsedModelInference     bool           `json:"used_model_inference,omitempty"`     // meta/done：是否模型推断
@@ -590,12 +868,6 @@ func (s *ChatService) AskStream(
 	if err != nil {
 		return nil, nil, err
 	}
-	history, err := s.loadHistory(ctx, conv.ID)
-	if err != nil {
-		return nil, nil, err
-	}
-	memories := s.loadEnabledMemories(ctx, userID)
-
 	// 持久化 user 消息
 	if _, _, err := InsertMessage(ctx, s.db, conv.ID, "user", question, false); err != nil {
 		return nil, nil, common.SystemError(err)
@@ -604,15 +876,11 @@ func (s *ChatService) AskStream(
 	// 物化标识供生成器使用，避免旧会话对象在生成器中脱管失效
 	conversationUUID2 := conv.UUID
 	conversationID := conv.ID
-	// agent loop 在 setup 阶段（db 仍可用）跑完
-	toolDefs, toolExecutor := s.buildToolContext(ctx, userID, userRole)
-	var toolResults []string
-	var toolCalls []map[string]any
-	if toolExecutor != nil {
-		toolResults, toolCalls = s.rag.RunToolLoop(ctx, question, toolDefs, toolExecutor, history)
-	}
 
-	// 状态机：透传 RAG 事件，done 时落库
+	// 状态机：透传 RAG 事件，done 时落库。
+	// 初始 pending 携带 status 事件：会话建立即产出（agent loop 与检索 prepare 之前），
+	// 前端收到后立刻进入思考态（展开思考面板、刷新会话列表），
+	// 消除工具决策/意图判定/检索期间 3-5s 的感知空白。
 	state := &streamState{
 		chat:               s,
 		userID:             userID,
@@ -623,13 +891,18 @@ func (s *ChatService) AskStream(
 		citations:          nil,
 		usedModelInference: false,
 		done:               false,
+		pending:            []*StreamEvent{{Type: "status", ConversationID: conversationUUID2}},
 	}
 
-	// 启动 RAG 流式生成，将事件投递到 chan
 	events := make(chan rag.StreamEvent, 16)
 	errCh := make(chan error, 1)
+
+	// 慢阶段在 goroutine 中执行：status 已由 pending 队列先行送出（handler 写出
+	// SSE 头后立即消费），工具决策的 LLM 调用不再阻塞 SSE 首字节。
+	// sql.DB 为连接池，goroutine 中使用安全；ctx 取消时经由 emit/errCh 收敛退出。
 	go func() {
-		errCh <- s.rag.AnswerStream(ctx, question, history, memories, toolResults, toolCalls, func(e rag.StreamEvent) error {
+		defer close(events)
+		emit := func(e rag.StreamEvent) error {
 			// 客户端断开/ctx 取消时不再阻塞发送，避免 goroutine 与事件永久泄漏（H7）
 			select {
 			case events <- e:
@@ -637,8 +910,64 @@ func (s *ChatService) AskStream(
 			case <-ctx.Done():
 				return ctx.Err()
 			}
-		})
-		close(events)
+		}
+		history, err := s.loadHistory(ctx, conversationID)
+		if err != nil {
+			errCh <- common.SystemError(err)
+			return
+		}
+		memories := s.loadEnabledMemories(ctx, userID)
+
+		// 会话内待确认的 MCP 工具调用：确认→执行一次；取消→作废；其他输入→忽略
+		pendingOut := s.resolvePendingToolCall(ctx, conversationID, question, userID, userRole)
+		if pendingOut.directReply != "" {
+			// 直接回复（取消/等待/失败/审批提示）：跳过记忆提取，
+			// 正文经 delta 累积进 state.content，由 done 触发 finalizeStream 落库一次
+			state.skipMemory = true
+			_ = emit(rag.StreamEvent{Type: "delta", Text: pendingOut.directReply})
+			_ = emit(rag.StreamEvent{Type: "done", Content: "", UsedModelInference: false})
+			errCh <- nil
+			return
+		}
+		toolResults, toolCalls := pendingOut.toolResults, pendingOut.toolCalls
+		question2 := question
+		if pendingOut.ragQuestion != "" {
+			// 已按用户确认执行完工具，以触发审批的原始问题生成回答
+			question2 = pendingOut.ragQuestion
+		} else {
+			// 工具决策（LLM 调用）；注册表（集群基础信息）注入决策 prompt，
+			// 信息不足时决策模型返回反问文案
+			toolDefs, toolExecutor := s.buildToolContext(ctx, userID, userRole, false)
+			if toolExecutor != nil {
+				var approvalErr *rag.ToolApprovalRequiredError
+				var clarification string
+				var runErr error
+				toolResults, toolCalls, clarification, runErr = s.rag.RunToolLoop(
+					ctx, question, toolDefs, toolExecutor, history, s.loadClusterRegistry(ctx))
+				if runErr != nil {
+					if errors.As(runErr, &approvalErr) {
+						// 需二次确认的工具：暂存调用并反问用户，不执行
+						prompt := s.handleApprovalRequired(ctx, conversationID, question, approvalErr)
+						state.skipMemory = true
+						_ = emit(rag.StreamEvent{Type: "delta", Text: prompt})
+						_ = emit(rag.StreamEvent{Type: "done", Content: "", UsedModelInference: false})
+						errCh <- nil
+						return
+					}
+					errCh <- common.SystemError(runErr)
+					return
+				}
+				if clarification != "" {
+					// 决策模型判定信息不足：直接反问，不走 RAG 回答
+					_ = emit(rag.StreamEvent{Type: "delta", Text: clarification})
+					_ = emit(rag.StreamEvent{Type: "done", Content: "", UsedModelInference: false})
+					errCh <- nil
+					return
+				}
+			}
+		}
+
+		errCh <- s.rag.AnswerStream(ctx, question2, history, memories, toolResults, toolCalls, emit)
 	}()
 
 	var next func() (*StreamEvent, error)
@@ -646,18 +975,45 @@ func (s *ChatService) AskStream(
 		if state.done {
 			return nil, ioEOF
 		}
+		// 兜底补发队列：流式生成早期失败（prepare 出错，meta 尚未发出）时，
+		// 先补发 meta（客户端需要 conversation_id）与兜底文案 delta，再走 done，
+		// 保证客户端能看到兜底文案而不是只收到一个空 done。
+		if len(state.pending) > 0 {
+			ev := state.pending[0]
+			state.pending = state.pending[1:]
+			if ev.Type == "delta" {
+				state.contentMu.Lock()
+				state.content += ev.Text
+				state.contentMu.Unlock()
+			}
+			return ev, nil
+		}
+		if state.streamClosed {
+			// 生成器已结束（异常路径）：落库兜底文案并结束
+			return s.finalizeStream(ctx, state, rag.FallbackAnswer, state.usedModelInference)
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case e, ok := <-events:
 			if !ok {
-				// 事件流关闭后检查 RAG 是否出错
+				// 事件流关闭：检查 RAG 是否出错，出错也走 done 流程，落库兜底文案
+				state.streamClosed = true
 				if err := <-errCh; err != nil {
-					// 出错也走 done 流程，落库兜底文案
-					return s.finalizeStream(ctx, state, rag.FallbackAnswer, state.usedModelInference)
+					slog.WarnContext(ctx, "流式问答生成失败，降级为兜底回复", "error", err)
+				} else {
+					slog.WarnContext(ctx, "流式问答未收到 done 事件，降级为兜底回复")
 				}
-				// 未收到 done 但流已关闭：兜底
-				return s.finalizeStream(ctx, state, rag.FallbackAnswer, state.usedModelInference)
+				state.pending = []*StreamEvent{
+					{
+						Type:               "meta",
+						ConversationID:     state.conversationUUID,
+						Citations:          state.citations,
+						UsedModelInference: state.usedModelInference,
+					},
+					{Type: "delta", Text: rag.FallbackAnswer},
+				}
+				return next()
 			}
 			switch e.Type {
 			case "meta":
@@ -708,6 +1064,13 @@ type streamState struct {
 	content            string
 	contentMu          sync.Mutex
 	done               bool
+	// streamClosed 生成器已结束（异常路径），后续调用走兜底落库
+	streamClosed bool
+	// pending 补发队列：流开始时的 status 事件（见 AskStream），以及流式生成早期
+	// 失败（prepare 出错，meta 尚未发出）时的兜底 meta/delta，见 next() 中的说明
+	pending []*StreamEvent
+	// skipMemory 直接回复（取消/等待/审批提示）时跳过长期记忆提取
+	skipMemory bool
 }
 
 // finalizeStream 落库助手消息、引用、审计与长期记忆，返回 done 事件。
@@ -721,7 +1084,7 @@ func (s *ChatService) finalizeStream(ctx context.Context, state *streamState, co
 	// M10）。错误路径调用方传入 state.usedModelInference（meta 值）作为兜底。
 	finalInference := usedModelInference
 	// 落库
-	msg, memoryFailed, err := s.persistAssistant(ctx, state.conversationID, state.conversationUUID, content, toRagCitations(state.citations), finalInference, state.userID, state.userRole, state.question)
+	msg, memoryFailed, err := s.persistAssistant(ctx, state.conversationID, state.conversationUUID, content, toRagCitations(state.citations), finalInference, state.userID, state.userRole, state.question, state.skipMemory)
 	if err != nil {
 		slog.WarnContext(ctx, "流式问答落库失败", "error", err)
 	}

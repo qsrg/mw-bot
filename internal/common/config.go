@@ -31,12 +31,14 @@ type Settings struct {
 	ChromaPersistPath string // chromem-go 持久化目录
 
 	// 检索
-	HybridSearch           bool     // 是否启用混合检索（dense + BM25）
-	RetrieveLimit          int      // 召回候选 chunk 数
-	RetrieveScoreThreshold float64  // 检索相关性阈值（余弦相似度下限）
-	RerankTopN             int      // rerank 后注入 prompt 的最终条数
-	IntentDetection        bool     // 是否启用 LLM 意图精判
-	Middlewares            []string // 中间件注册表（逗号分隔解析为切片）
+	HybridSearch                 bool     // 是否启用混合检索（dense + BM25）
+	RetrieveLimit                int      // 召回候选 chunk 数
+	RetrieveScoreThreshold       float64  // 检索相关性阈值（余弦相似度下限）
+	CitationScoreThreshold       float64  // 引用质量阈值：dense 余弦分低于此值的弱命中不进引用与 prompt（高于检索阈值）
+	AmbiguityProbeScoreThreshold float64  // 跨中间件歧义探测阈值：高于主检索阈值，避免弱相关命中误触发反问
+	RerankTopN                   int      // rerank 后注入 prompt 的最终条数
+	IntentDetection              bool     // 是否启用 LLM 意图精判
+	Middlewares                  []string // 中间件注册表（逗号分隔解析为切片）
 
 	// 会话记忆
 	HistoryTokenBudget int     // 会话短期记忆 token 预算
@@ -167,12 +169,14 @@ func Load() Settings {
 		ChromaPersistPath: getenv("CHROMA_PERSIST_PATH", "data/chroma"),
 
 		// 检索
-		HybridSearch:           getenvBool("HYBRID_SEARCH", true),
-		RetrieveLimit:          getenvInt("RETRIEVE_LIMIT", 5),
-		RetrieveScoreThreshold: getenvFloat("RETRIEVE_SCORE_THRESHOLD", 0.3),
-		RerankTopN:             getenvInt("RERANK_TOP_N", 5),
-		IntentDetection:        getenvBool("INTENT_DETECTION", false),
-		Middlewares:            getenvStringSlice("MIDDLEWARES", "rocketmq,kafka,rabbitmq,pulsar,redis,nacos"),
+		HybridSearch:                 getenvBool("HYBRID_SEARCH", true),
+		RetrieveLimit:                getenvInt("RETRIEVE_LIMIT", 5),
+		RetrieveScoreThreshold:       getenvFloat("RETRIEVE_SCORE_THRESHOLD", 0.3),
+		CitationScoreThreshold:       getenvFloat("CITATION_SCORE_THRESHOLD", 0.4),
+		AmbiguityProbeScoreThreshold: getenvFloat("AMBIGUITY_PROBE_SCORE_THRESHOLD", 0.5),
+		RerankTopN:                   getenvInt("RERANK_TOP_N", 5),
+		IntentDetection:              getenvBool("INTENT_DETECTION", true),
+		Middlewares:                  getenvStringSlice("MIDDLEWARES", "rocketmq,kafka,rabbitmq,pulsar,redis,nacos"),
 
 		// 会话记忆
 		HistoryTokenBudget: getenvInt("HISTORY_TOKEN_BUDGET", 100000),

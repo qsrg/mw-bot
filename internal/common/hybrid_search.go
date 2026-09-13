@@ -143,5 +143,18 @@ func HybridSearch(ctx context.Context, vs VectorStore, bm25 *BM25Index, query st
 		})
 	}
 	fused := RRFFusion(dense, sparse, rrfDefaultK, limit)
+	// 回填 DenseScore：融合分只反映排名，不与余弦阈值可比；
+	// 按 chunk 记录 dense 路最高余弦分，供下游引用质量门控使用。
+	// 仅 BM25 命中的 chunk（dense 未召回）DenseScore 为 0，视为无语义证据。
+	denseScoreByKey := make(map[string]float64, len(dense))
+	for _, d := range dense {
+		key := chunkKey(d.Metadata, d.Text)
+		if d.Score > denseScoreByKey[key] {
+			denseScoreByKey[key] = d.Score
+		}
+	}
+	for i := range fused {
+		fused[i].DenseScore = denseScoreByKey[chunkKey(fused[i].Metadata, fused[i].Text)]
+	}
 	return fused, nil
 }

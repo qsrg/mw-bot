@@ -18,6 +18,12 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAdmin: true },
   },
   {
+    path: "/admin/clusters",
+    name: "admin-clusters",
+    component: () => import("../views/admin/AdminClustersView.vue"),
+    meta: { requiresAdmin: true },
+  },
+  {
     path: "/admin/tools",
     name: "admin-tools",
     component: () => import("../views/admin/AdminToolsView.vue"),

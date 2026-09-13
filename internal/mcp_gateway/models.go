@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"strings"
 )
 
 // McpServer MCP Server 注册记录，对应 mcp_servers 表。
@@ -30,22 +31,22 @@ type McpServer struct {
 
 // McpTool MCP 工具策略记录，对应 mcp_tools 表。
 type McpTool struct {
-	ID                int64           `json:"id"`                  // 主键ID
-	UUID              string          `json:"uuid"`                // 对外标识
-	ServerID          int64           `json:"server_id"`           // 所属 Server(mcp_servers.id)
-	ToolName          string          `json:"tool_name"`           // 工具名
-	Description       string          `json:"description"`         // 描述
-	InputSchema       json.RawMessage `json:"input_schema"`        // 输入 schema（JSON）
-	ReadOnly          bool            `json:"read_only"`           // 是否只读
-	Destructive       bool            `json:"destructive"`         // 是否破坏性
-	RequiresApproval  bool            `json:"requires_approval"`   // 是否需要二次确认
-	Enabled           bool            `json:"enabled"`             // 是否启用
-	AllowedRoles      []string        `json:"allowed_roles"`       // 允许角色（JSON 数组）
-	TimeoutSeconds    int             `json:"timeout_seconds"`     // 超时(秒)
-	RateLimit         string          `json:"rate_limit"`          // 限流配置（如 "60/minute"）
-	ResultSizeLimit   int             `json:"result_size_limit"`   // 结果大小限制(字节)
-	CreatedAt         time.Time       `json:"created_at"`          // 创建时间
-	UpdatedAt         time.Time       `json:"updated_at"`          // 更新时间
+	ID               int64           `json:"id"`                // 主键ID
+	UUID             string          `json:"uuid"`              // 对外标识
+	ServerID         int64           `json:"server_id"`         // 所属 Server(mcp_servers.id)
+	ToolName         string          `json:"tool_name"`         // 工具名
+	Description      string          `json:"description"`       // 描述
+	InputSchema      json.RawMessage `json:"input_schema"`      // 输入 schema（JSON）
+	ReadOnly         bool            `json:"read_only"`         // 是否只读
+	Destructive      bool            `json:"destructive"`       // 是否破坏性
+	RequiresApproval bool            `json:"requires_approval"` // 是否需要二次确认
+	Enabled          bool            `json:"enabled"`           // 是否启用
+	AllowedRoles     []string        `json:"allowed_roles"`     // 允许角色（JSON 数组）
+	TimeoutSeconds   int             `json:"timeout_seconds"`   // 超时(秒)
+	RateLimit        string          `json:"rate_limit"`        // 限流配置（如 "60/minute"）
+	ResultSizeLimit  int             `json:"result_size_limit"` // 结果大小限制(字节)
+	CreatedAt        time.Time       `json:"created_at"`        // 创建时间
+	UpdatedAt        time.Time       `json:"updated_at"`        // 更新时间
 }
 
 // GetServerByUUID 按 uuid 查询 Server，不存在返回 (nil, nil)。
@@ -467,18 +468,18 @@ func UpdateToolPolicy(
 // ToolCallRecord 工具调用记录，对应 tool_calls 表。
 // 由 mcp_gateway 写入，chat/rag 模块会回填 message_id 关联。
 type ToolCallRecord struct {
-	ID         int64          `json:"id"`          // 主键ID
-	UUID       string         `json:"uuid"`        // 对外标识
-	MessageID  sql.NullInt64  `json:"message_id"`  // 关联消息ID（可空）
-	UserID     int64          `json:"user_id"`     // 调用用户(users.id)
-	ToolName   string         `json:"tool_name"`   // 工具名
-	ServerID   int64          `json:"server_id"`   // MCP Server ID
-	Input      json.RawMessage `json:"input"`      // 输入参数（JSON，可空）
-	Output     json.RawMessage `json:"output"`     // 输出结果摘要（JSON，可空）
-	Status     string         `json:"status"`      // 状态：running/success/failed/timeout
-	Error      string         `json:"error"`       // 错误信息（可空）
-	DurationMs sql.NullInt64  `json:"duration_ms"` // 耗时(毫秒，可空)
-	CreatedAt  time.Time      `json:"created_at"`  // 创建时间
+	ID         int64           `json:"id"`          // 主键ID
+	UUID       string          `json:"uuid"`        // 对外标识
+	MessageID  sql.NullInt64   `json:"message_id"`  // 关联消息ID（可空）
+	UserID     int64           `json:"user_id"`     // 调用用户(users.id)
+	ToolName   string          `json:"tool_name"`   // 工具名
+	ServerID   int64           `json:"server_id"`   // MCP Server ID
+	Input      json.RawMessage `json:"input"`       // 输入参数（JSON，可空）
+	Output     json.RawMessage `json:"output"`      // 输出结果摘要（JSON，可空）
+	Status     string          `json:"status"`      // 状态：running/success/failed/timeout
+	Error      string          `json:"error"`       // 错误信息（可空）
+	DurationMs sql.NullInt64   `json:"duration_ms"` // 耗时(毫秒，可空)
+	CreatedAt  time.Time       `json:"created_at"`  // 创建时间
 }
 
 // InsertToolCall 插入工具调用记录，返回新主键 ID 与生成的 uuid。
@@ -523,4 +524,207 @@ func nullJSON(b json.RawMessage) any {
 		return nil
 	}
 	return b
+}
+
+// MiddlewareCluster 中间件集群注册表：各中间件的集群基础信息人工维护。
+//
+// 供 MCP 工具决策使用：把用户口中的"中间件/机房/集群业务别名"映射为真实
+// 集群名；cluster_name 为真实集群名（组件配置，MCP 工具入参），display_name
+// 为用户可读别名；连接地址（rocketmq 为 NameServer）为权威连接信息，
+// 调用工具时由会话层解析注入。同一连接地址下多个集群为多行登记。
+type MiddlewareCluster struct {
+	ID          int64
+	UUID        string
+	Middleware  string
+	ClusterName string
+	DisplayName string
+	Datacenter  string
+	Namesrv     string
+	Description string
+	Enabled     bool
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+const middlewareClusterCols = `id, uuid, middleware, cluster_name, display_name, datacenter, namesrv, description, enabled, created_at, updated_at`
+
+// scanMiddlewareCluster 扫描一行集群登记记录。
+func scanMiddlewareCluster(row interface{ Scan(...any) error }) (*MiddlewareCluster, error) {
+	c := &MiddlewareCluster{}
+	var displayName any
+	err := row.Scan(&c.ID, &c.UUID, &c.Middleware, &c.ClusterName, &displayName,
+		&c.Datacenter, &c.Namesrv, &c.Description, &c.Enabled, &c.CreatedAt, &c.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if s, ok := displayName.(string); ok {
+		c.DisplayName = s
+	}
+	return c, nil
+}
+
+// ListEnabledMiddlewareClusters 列出启用的集群登记（按中间件、机房、集群名排序）。
+func ListEnabledMiddlewareClusters(ctx context.Context, db *sql.DB) ([]*MiddlewareCluster, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT `+middlewareClusterCols+` FROM middleware_clusters
+		 WHERE enabled = 1 ORDER BY middleware ASC, datacenter ASC, cluster_name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list middleware clusters: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*MiddlewareCluster, 0)
+	for rows.Next() {
+		c, err := scanMiddlewareCluster(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan middleware cluster: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ListMiddlewareClusters 列出全部集群登记（含停用，管理端列表用）。
+func ListMiddlewareClusters(ctx context.Context, db *sql.DB) ([]*MiddlewareCluster, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT `+middlewareClusterCols+` FROM middleware_clusters
+		 ORDER BY middleware ASC, datacenter ASC, cluster_name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list middleware clusters: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*MiddlewareCluster, 0)
+	for rows.Next() {
+		c, err := scanMiddlewareCluster(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan middleware cluster: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// GetMiddlewareClusterByName 按真实集群名或业务别名取集群登记。
+// 先按 cluster_name 精确匹配，未命中再按 display_name 匹配；均未命中返回 nil。
+func GetMiddlewareClusterByName(ctx context.Context, db *sql.DB, name string) (*MiddlewareCluster, error) {
+	row := db.QueryRowContext(ctx,
+		`SELECT `+middlewareClusterCols+` FROM middleware_clusters WHERE cluster_name = ?`, name)
+	c, err := scanMiddlewareCluster(row)
+	if err == nil {
+		return c, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("get middleware cluster: %w", err)
+	}
+	row = db.QueryRowContext(ctx,
+		`SELECT `+middlewareClusterCols+` FROM middleware_clusters WHERE display_name = ?`, name)
+	c, err = scanMiddlewareCluster(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get middleware cluster: %w", err)
+	}
+	return c, nil
+}
+
+// GetMiddlewareClusterByUUID 按对外标识取集群登记，不存在返回 nil。
+func GetMiddlewareClusterByUUID(ctx context.Context, db *sql.DB, clusterUUID string) (*MiddlewareCluster, error) {
+	row := db.QueryRowContext(ctx,
+		`SELECT `+middlewareClusterCols+` FROM middleware_clusters WHERE uuid = ?`, clusterUUID)
+	c, err := scanMiddlewareCluster(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get middleware cluster: %w", err)
+	}
+	return c, nil
+}
+
+// CreateMiddlewareCluster 新增集群登记，返回新记录。
+func CreateMiddlewareCluster(ctx context.Context, db *sql.DB, c *MiddlewareCluster) (*MiddlewareCluster, error) {
+	c.UUID = uuid.New().String()
+	if strings.TrimSpace(c.DisplayName) == "" {
+		c.DisplayName = c.ClusterName
+	}
+	const q = `INSERT INTO middleware_clusters
+		(uuid, middleware, cluster_name, display_name, datacenter, namesrv, description, enabled)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	res, err := db.ExecContext(ctx, q, c.UUID, c.Middleware, c.ClusterName, c.DisplayName,
+		c.Datacenter, c.Namesrv, c.Description, boolToInt(c.Enabled))
+	if err != nil {
+		return nil, fmt.Errorf("create middleware cluster: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("get last insert id: %w", err)
+	}
+	c.ID = id
+	return c, nil
+}
+
+// UpdateMiddlewareCluster 更新集群登记（仅更新非 nil 指针字段），返回更新后记录。
+func UpdateMiddlewareCluster(ctx context.Context, db *sql.DB, clusterUUID string,
+	middleware, clusterName, displayName, datacenter, namesrv, description *string, enabled *bool,
+) (*MiddlewareCluster, error) {
+	c, err := GetMiddlewareClusterByUUID(ctx, db, clusterUUID)
+	if err != nil {
+		return nil, err
+	}
+	if c == nil {
+		return nil, nil
+	}
+	if middleware != nil && strings.TrimSpace(*middleware) != "" {
+		c.Middleware = strings.ToLower(strings.TrimSpace(*middleware))
+	}
+	if clusterName != nil && strings.TrimSpace(*clusterName) != "" {
+		c.ClusterName = strings.TrimSpace(*clusterName)
+	}
+	if displayName != nil {
+		dn := strings.TrimSpace(*displayName)
+		if dn == "" {
+			dn = c.ClusterName
+		}
+		c.DisplayName = dn
+	}
+	if datacenter != nil && strings.TrimSpace(*datacenter) != "" {
+		c.Datacenter = strings.TrimSpace(*datacenter)
+	}
+	if namesrv != nil {
+		c.Namesrv = strings.TrimSpace(*namesrv)
+	}
+	if description != nil {
+		c.Description = strings.TrimSpace(*description)
+	}
+	if enabled != nil {
+		c.Enabled = *enabled
+	}
+	const q = `UPDATE middleware_clusters SET middleware = ?, cluster_name = ?, display_name = ?,
+		datacenter = ?, namesrv = ?, description = ?, enabled = ? WHERE id = ?`
+	if _, err := db.ExecContext(ctx, q, c.Middleware, c.ClusterName, c.DisplayName,
+		c.Datacenter, c.Namesrv, c.Description, boolToInt(c.Enabled), c.ID); err != nil {
+		return nil, fmt.Errorf("update middleware cluster: %w", err)
+	}
+	return c, nil
+}
+
+// DeleteMiddlewareCluster 删除集群登记。
+func DeleteMiddlewareCluster(ctx context.Context, db *sql.DB, clusterUUID string) (bool, error) {
+	res, err := db.ExecContext(ctx, `DELETE FROM middleware_clusters WHERE uuid = ?`, clusterUUID)
+	if err != nil {
+		return false, fmt.Errorf("delete middleware cluster: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("delete middleware cluster: %w", err)
+	}
+	return n > 0, nil
+}
+
+// boolToInt 布尔转 0/1（TINYINT 存储）。
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

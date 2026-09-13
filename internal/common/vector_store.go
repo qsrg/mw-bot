@@ -19,11 +19,14 @@ import (
 )
 
 // SearchResult 检索结果。Score 为相似度或融合后的归一化分数。
+// DenseScore 为 dense 路余弦相似度：混合检索下 Score 是 RRF 融合分（归一化到 [0,1]），
+// 不可与余弦阈值比较，下游引用质量门控应使用 DenseScore。
 type SearchResult struct {
-	ID       string            // 文档/chunk 全局唯一 ID
-	Text     string            // chunk 文本内容
-	Score    float64          // 相似度或融合分数（与查询相关性，越高越相关）
-	Metadata map[string]string // 元数据（document_id/knowledge_base_id/chunk_index 等）
+	ID         string            // 文档/chunk 全局唯一 ID
+	Text       string            // chunk 文本内容
+	Score      float64           // 相似度或融合分数（与查询相关性，越高越相关）
+	DenseScore float64           // dense 路余弦相似度（纯向量检索下等于 Score）
+	Metadata   map[string]string // 元数据（document_id/knowledge_base_id/chunk_index 等）
 }
 
 // Document 待写入向量库的文档。Embedding 必须与查询向量同维度。
@@ -247,10 +250,11 @@ func (s *ChromemVectorStore) SimilaritySearch(ctx context.Context, queryVec []fl
 			continue
 		}
 		out = append(out, SearchResult{
-			ID:       r.ID,
-			Text:     r.Content,
-			Score:    score,
-			Metadata: r.Metadata,
+			ID:         r.ID,
+			Text:       r.Content,
+			Score:      score,
+			DenseScore: score,
+			Metadata:   r.Metadata,
 		})
 	}
 	// 结果已按相似度降序返回，无需重排
@@ -367,10 +371,11 @@ func (s *InMemoryVectorStore) SimilaritySearch(ctx context.Context, queryVec []f
 			continue
 		}
 		results = append(results, SearchResult{
-			ID:       doc.ID,
-			Text:     doc.Text,
-			Score:    score,
-			Metadata: doc.Metadata,
+			ID:         doc.ID,
+			Text:       doc.Text,
+			Score:      score,
+			DenseScore: score,
+			Metadata:   doc.Metadata,
 		})
 	}
 	// 按分数降序取 topN

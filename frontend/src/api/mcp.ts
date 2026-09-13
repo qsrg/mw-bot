@@ -95,3 +95,62 @@ export async function invokeTool(
   });
   return response.data;
 }
+
+// 中间件集群注册信息
+export interface MiddlewareCluster {
+  id: string;
+  middleware: string; // 所属中间件（rocketmq/kafka/...）
+  cluster_name: string; // 真实集群名（MCP 工具入参）
+  display_name: string; // 业务别名（用户可读，可与真实名不同）
+  datacenter: string;
+  namesrv: string;
+  description: string;
+  enabled: boolean;
+  created_at: string;
+}
+
+// 集群登记请求体
+export interface ClusterPayload {
+  middleware?: string;
+  cluster_name?: string;
+  display_name?: string;
+  datacenter?: string;
+  namesrv?: string;
+  description?: string;
+  enabled?: boolean;
+}
+
+// 列出集群登记
+export async function listClusters(): Promise<MiddlewareCluster[]> {
+  const response = await http.get<MiddlewareCluster[]>("/mcp/clusters");
+  return response.data;
+}
+
+// 可登记的中间件选项（来自后端 MIDDLEWARES 配置）
+export async function listMiddlewareOptions(): Promise<string[]> {
+  const response = await http.get<string[]>("/mcp/middleware-options");
+  return response.data;
+}
+
+// 新增集群登记（同中间件下真实集群名唯一）
+export async function createCluster(payload: ClusterPayload): Promise<MiddlewareCluster> {
+  const response = await http.post<MiddlewareCluster>("/mcp/clusters", payload);
+  return response.data;
+}
+
+// 更新集群登记（字段省略表示不改，可启停）
+export async function updateCluster(
+  clusterId: string,
+  payload: ClusterPayload,
+): Promise<MiddlewareCluster> {
+  const response = await http.patch<MiddlewareCluster>(
+    `/mcp/clusters/${clusterId}`,
+    payload,
+  );
+  return response.data;
+}
+
+// 删除集群登记
+export async function deleteCluster(clusterId: string): Promise<void> {
+  await http.delete(`/mcp/clusters/${clusterId}`);
+}
